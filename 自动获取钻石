@@ -1,0 +1,650 @@
+// ==UserScript==
+// @name         Uranium全覆盖点击器
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  在运输带上设置全覆盖点击网格，密集分布确保万无一失
+// @author       大大 @designtim
+// @match        https://www.geturanium.io/*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (window.uraniumClickerInitialized) return;
+    window.uraniumClickerInitialized = true;
+
+    const config = {
+        clickInterval: 150,
+        wallCount: 10,
+        wallRange: { start: 10, end: 90 },
+        wallPositions: [],
+        pointsPerWall: 10,
+        gridMode: true,
+        debug: true,
+        isRunning: true,
+        hitCount: 0,
+        recentHits: [],
+        pointOpacity: 0.5,
+        panelCollapsed: false
+    };
+
+    for (let i = 0; i < config.wallCount; i++) {
+        const range = config.wallRange.end - config.wallRange.start;
+        const position = config.wallRange.start + (range * i / (config.wallCount - 1));
+        config.wallPositions.push(Number(position.toFixed(1)));
+    }
+
+    const clickPoints = [];
+    let clickIntervalId = null;
+    let conveyorElement = null;
+    let shardCache = new Set();
+    let statsIntervalId = null;
+    const clickEffects = [];
+
+    function findConveyorElement() {
+        return document.querySelector('.conveyor-track.ConveyorBelt_enhancedTrack__vMgYX');
+    }
+
+    function safeDispatchClick(element, x, y) {
+        if (!element || typeof element.dispatchEvent !== 'function') return false;
+        
+        try {
+            showClickEffect(x, y);
+            
+            ['mousedown', 'mouseup', 'click'].forEach(eventType => {
+                const event = new MouseEvent(eventType, {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    button: 0,
+                    buttons: eventType === 'mousedown' ? 1 : 0,
+                    clientX: x,
+                    clientY: y,
+                    screenX: x,
+                    screenY: y
+                });
+                element.dispatchEvent(event);
+            });
+            
+            return true;
+        } catch (err) {
+            console.error('点击事件分发失败:', err);
+            return false;
+        }
+    }
+
+    function showClickEffect(x, y) {
+        let effect = clickEffects.find(e => !e.active);
+        
+        if (!effect) {
+            const el = document.createElement('div');
+            el.className = 'uranium-click-effect';
+            el.style.cssText = `
+                position: fixed;
+                width: 30px;
+                height: 30px;
+                border-radius: 50%;
+                border: 2px solid #ffeb3b;
+                box-shadow: 0 0 10px rgba(255, 235, 59, 0.8);
+                pointer-events: none;
+                z-index: 10000;
+                opacity: 0;
+                transform: translate(-50%, -50%) scale(0.2);
+                transition: transform 0.3s ease-out, opacity 0.3s ease-out;
+            `;
+            document.body.appendChild(el);
+            
+            effect = {
+                element: el,
+                active: false
+            };
+            clickEffects.push(effect);
+        }
+        
+        effect.active = true;
+        effect.element.style.left = `${x}px`;
+        effect.element.style.top = `${y}px`;
+        
+        setTimeout(() => {
+            effect.element.style.opacity = '1';
+            effect.element.style.transform = 'translate(-50%, -50%) scale(1)';
+            
+            setTimeout(() => {
+                effect.element.style.opacity = '0';
+                effect.element.style.transform = 'translate(-50%, -50%) scale(0.2)';
+                
+                setTimeout(() => {
+                    effect.active = false;
+                }, 300);
+            }, 200);
+        }, 0);
+    }
+
+    function createClickPoint(container, xPercent, yPercent, color = 'rgba(255, 0, 0, 0.7)', size = 6) {
+        const rect = container.getBoundingClientRect();
+        const point = document.createElement('div');
+        point.className = 'uranium-click-point';
+        
+        const x = rect.left + (rect.width * xPercent / 100);
+        const y = rect.top + (rect.height * yPercent / 100);
+        
+        let adjustedColor = color;
+        if (color.includes('rgba')) {
+            adjustedColor = color.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/, 
+                                        `rgba($1,$2,$3,${config.pointOpacity})`);
+        }
+        
+        point.style.cssText = `
+            position: fixed;
+            left: ${x}px;
+            top: ${y}px;
+            width: ${size}px;
+            height: ${size}px;
+            background-color: ${adjustedColor};
+            border-radius: 50%;
+            z-index: 10000;
+            pointer-events: none;
+            transform: translate(-50%, -50%);
+            transition: transform 0.1s, background-color 0.1s;
+            box-shadow: 0 0 3px rgba(0,0,0,0.3);
+        `;
+        document.body.appendChild(point);
+        
+        point.actualX = x;
+        point.actualY = y;
+        point.xPercent = xPercent;
+        point.yPercent = yPercent;
+        point.color = adjustedColor;
+        point.size = size;
+        point.hitCount = 0;
+        
+        return point;
+    }
+
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.className = 'uranium-control-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 10001;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 180px;
+            transition: all 0.3s ease;
+        `;
+        
+        const headerContainer = document.createElement('div');
+        headerContainer.style.cssText = `
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        `;
+        
+        const title = document.createElement('div');
+        title.textContent = 'Uranium全覆盖点击器 v1.0';
+        title.style.fontWeight = 'bold';
+        headerContainer.appendChild(title);
+        
+        const collapseButton = document.createElement('button');
+        collapseButton.innerHTML = '⇱';
+        collapseButton.title = '折叠/展开面板';
+        collapseButton.style.cssText = `
+            background: none;
+            border: none;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+            padding: 0 5px;
+            margin-left: 10px;
+        `;
+        
+        const contentContainer = document.createElement('div');
+        contentContainer.className = 'uranium-panel-content';
+        contentContainer.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 100%;
+            overflow: hidden;
+            transition: height 0.3s ease, opacity 0.3s ease;
+        `;
+        
+        collapseButton.onclick = function() {
+            config.panelCollapsed = !config.panelCollapsed;
+            if (config.panelCollapsed) {
+                this.innerHTML = '⇲';
+                contentContainer.style.height = '0';
+                contentContainer.style.opacity = '0';
+                contentContainer.style.margin = '0';
+                panel.style.minWidth = 'auto';
+                panel.style.padding = '5px 10px';
+            } else {
+                this.innerHTML = '⇱';
+                contentContainer.style.height = 'auto';
+                contentContainer.style.opacity = '1';
+                contentContainer.style.margin = '8px 0 0 0';
+                panel.style.minWidth = '180px';
+                panel.style.padding = '10px';
+            }
+        };
+        
+        headerContainer.appendChild(collapseButton);
+        panel.appendChild(headerContainer);
+        
+        const toggleButton = document.createElement('button');
+        toggleButton.textContent = config.isRunning ? '停止点击' : '开始点击';
+        toggleButton.style.cssText = `
+            padding: 5px 10px;
+            background-color: ${config.isRunning ? '#ff4444' : '#4CAF50'};
+            border: none;
+            border-radius: 3px;
+            color: white;
+            cursor: pointer;
+        `;
+        toggleButton.onclick = function() {
+            config.isRunning = !config.isRunning;
+            this.textContent = config.isRunning ? '停止点击' : '开始点击';
+            this.style.backgroundColor = config.isRunning ? '#ff4444' : '#4CAF50';
+            
+            if (config.isRunning) {
+                startClicking();
+            } else {
+                stopClicking();
+            }
+        };
+        contentContainer.appendChild(toggleButton);
+        
+        const opacityContainer = document.createElement('div');
+        opacityContainer.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-top: 5px;
+        `;
+        
+        const opacityLabel = document.createElement('div');
+        opacityLabel.textContent = '点可见度:';
+        opacityLabel.style.fontSize = '12px';
+        opacityContainer.appendChild(opacityLabel);
+        
+        const opacityInput = document.createElement('input');
+        opacityInput.type = 'range';
+        opacityInput.min = '0';
+        opacityInput.max = '100';
+        opacityInput.step = '10';
+        opacityInput.value = config.pointOpacity * 100;
+        opacityInput.style.cssText = `
+            width: 80px;
+            height: 10px;
+        `;
+        opacityInput.onchange = function() {
+            const newOpacity = parseInt(this.value) / 100;
+            config.pointOpacity = newOpacity;
+            
+            clickPoints.forEach(point => {
+                const newColor = point.color.replace(/rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)/, 
+                                                   `rgba($1,$2,$3,${newOpacity})`);
+                point.style.backgroundColor = newColor;
+                point.color = newColor;
+            });
+        };
+        opacityContainer.appendChild(opacityInput);
+        
+        contentContainer.appendChild(opacityContainer);
+        
+        const intervalContainer = document.createElement('div');
+        intervalContainer.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-top: 5px;
+        `;
+        
+        const intervalLabel = document.createElement('div');
+        intervalLabel.textContent = '点击间隔:';
+        intervalLabel.style.fontSize = '12px';
+        intervalContainer.appendChild(intervalLabel);
+        
+        const intervalInput = document.createElement('input');
+        intervalInput.type = 'number';
+        intervalInput.min = '50';
+        intervalInput.max = '500';
+        intervalInput.step = '10';
+        intervalInput.value = config.clickInterval;
+        intervalInput.style.cssText = `
+            width: 60px;
+            padding: 3px;
+            border: 1px solid #555;
+            border-radius: 3px;
+            background-color: #333;
+            color: white;
+            font-size: 12px;
+        `;
+        intervalInput.onchange = function() {
+            const newInterval = parseInt(this.value);
+            if (newInterval >= 50 && newInterval <= 500) {
+                config.clickInterval = newInterval;
+                if (config.isRunning) {
+                    stopClicking();
+                    startClicking();
+                }
+            }
+        };
+        intervalContainer.appendChild(intervalInput);
+        
+        const intervalUnit = document.createElement('div');
+        intervalUnit.textContent = 'ms';
+        intervalUnit.style.fontSize = '12px';
+        intervalContainer.appendChild(intervalUnit);
+        
+        contentContainer.appendChild(intervalContainer);
+        
+        const hitCountDisplay = document.createElement('div');
+        hitCountDisplay.id = 'uranium-hit-count';
+        hitCountDisplay.style.cssText = `
+            margin-top: 5px;
+            font-size: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        `;
+        
+        const totalHits = document.createElement('div');
+        totalHits.id = 'uranium-total-hits';
+        totalHits.textContent = `总命中: ${config.hitCount}`;
+        hitCountDisplay.appendChild(totalHits);
+        
+        const recentHits = document.createElement('div');
+        recentHits.id = 'uranium-recent-hits';
+        recentHits.textContent = `速率: 0 次/10秒`;
+        hitCountDisplay.appendChild(recentHits);
+        
+        contentContainer.appendChild(hitCountDisplay);
+        
+        const info = document.createElement('div');
+        const totalPoints = config.gridMode 
+            ? config.wallPositions.length * config.pointsPerWall
+            : config.wallPositions.length * config.pointsPerWall;
+        info.textContent = `点击点: ${totalPoints}个 (${config.wallRange.start}%-${config.wallRange.end}%)`;
+        info.style.fontSize = '12px';
+        info.style.marginTop = '5px';
+        contentContainer.appendChild(info);
+        
+        
+        const contactInfo = document.createElement('div');
+        contactInfo.style.cssText = `
+            margin-top: 8px;
+            font-size: 11px;
+            color: #aaa;
+            text-align: center;
+        `;
+        contactInfo.innerHTML = '联系作者推特：大大 <a href="https://x.com/designtim" target="_blank" style="color: #3897f0; text-decoration: none;">@designtim</a>';
+        contentContainer.appendChild(contactInfo);
+        
+        panel.appendChild(contentContainer);
+        document.body.appendChild(panel);
+        
+        return panel;
+    }
+
+    function updateStats() {
+        const totalHitsElement = document.getElementById('uranium-total-hits');
+        const recentHitsElement = document.getElementById('uranium-recent-hits');
+        
+        if (totalHitsElement) {
+            totalHitsElement.textContent = `总命中: ${config.hitCount}`;
+        }
+        
+        if (recentHitsElement) {
+            const now = Date.now();
+            config.recentHits = config.recentHits.filter(time => now - time < 10000);
+            const rate = config.recentHits.length;
+            recentHitsElement.textContent = `速率: ${rate} 次/10秒`;
+        }
+    }
+
+    function highlightPoint(point) {
+        const originalSize = point.size || 6;
+        point.style.transform = `translate(-50%, -50%) scale(${1.5})`;
+        point.style.backgroundColor = 'rgba(255, 255, 0, 0.9)';
+        
+        setTimeout(() => {
+            point.style.transform = 'translate(-50%, -50%) scale(1)';
+            point.style.backgroundColor = point.color;
+        }, 150);
+        
+        point.hitCount++;
+    }
+
+    function isShardElement(element) {
+        if (!element) return false;
+        
+        if (element.classList && (
+            element.classList.contains('uranium-shard') ||
+            element.classList.contains('ConveyorBelt_shard__ahX3F')
+        )) {
+            return true;
+        }
+        
+        const parent = element.closest('.uranium-shard, .ConveyorBelt_shard__ahX3F');
+        if (parent) return true;
+        
+        if (element.getAttribute && (
+            element.getAttribute('data-shard-id') ||
+            element.getAttribute('data-value')
+        )) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    function initClickGrid() {
+        conveyorElement = findConveyorElement();
+        if (!conveyorElement) {
+            console.error('未找到运输带元素，将在1秒后重试');
+            setTimeout(initClickGrid, 1000);
+            return;
+        }
+        
+        clickPoints.forEach(point => point.remove());
+        clickPoints.length = 0;
+        
+        if (config.gridMode) {
+            const xPositions = config.wallPositions;
+            const yPositions = [];
+            
+            for (let i = 0; i < config.pointsPerWall; i++) {
+                const yPercent = 5 + (90 * i / (config.pointsPerWall - 1));
+                yPositions.push(Number(yPercent.toFixed(1)));
+            }
+            
+            const colors = [
+                'rgba(255, 0, 0, 0.7)',    
+                'rgba(0, 0, 255, 0.7)',    
+                'rgba(0, 255, 0, 0.7)',    
+                'rgba(255, 165, 0, 0.7)',  
+                'rgba(128, 0, 128, 0.7)',  
+                'rgba(0, 128, 128, 0.7)',  
+                'rgba(255, 0, 255, 0.7)',  
+                'rgba(128, 128, 0, 0.7)',  
+                'rgba(0, 255, 255, 0.7)',  
+                'rgba(128, 0, 0, 0.7)'     
+            ];
+            
+            for (let xIndex = 0; xIndex < xPositions.length; xIndex++) {
+                const xPercent = xPositions[xIndex];
+                const color = colors[xIndex % colors.length];
+                
+                for (let yIndex = 0; yIndex < yPositions.length; yIndex++) {
+                    const yPercent = yPositions[yIndex];
+                    const size = 4;
+                    const point = createClickPoint(conveyorElement, xPercent, yPercent, color, size);
+                    clickPoints.push(point);
+                }
+            }
+            
+            if (config.debug) {
+                console.log(`创建了 ${clickPoints.length} 个点击点构成的全覆盖网格`);
+            }
+        } else {
+            config.wallPositions.forEach((wallPercent, wallIndex) => {
+                const colors = [
+                    'rgba(255, 0, 0, 0.7)',    
+                    'rgba(0, 0, 255, 0.7)',    
+                    'rgba(0, 255, 0, 0.7)',    
+                    'rgba(255, 165, 0, 0.7)',  
+                    'rgba(128, 0, 128, 0.7)'   
+                ];
+                const color = colors[wallIndex % colors.length];
+                
+                for (let i = 0; i < config.pointsPerWall; i++) {
+                    const yPercent = (i + 1) * 100 / (config.pointsPerWall + 1);
+                    const point = createClickPoint(conveyorElement, wallPercent, yPercent, color);
+                    clickPoints.push(point);
+                }
+            });
+            
+            if (config.debug) {
+                console.log(`创建了 ${clickPoints.length} 个点击点组成的墙`);
+            }
+        }
+    }
+
+    function updateClickPointsPosition() {
+        if (!conveyorElement) return;
+        
+        const rect = conveyorElement.getBoundingClientRect();
+        clickPoints.forEach(point => {
+            const x = rect.left + (rect.width * point.xPercent / 100);
+            const y = rect.top + (rect.height * point.yPercent / 100);
+            
+            point.style.left = `${x}px`;
+            point.style.top = `${y}px`;
+            
+            point.actualX = x;
+            point.actualY = y;
+        });
+    }
+
+    function performClicks() {
+        if (!config.isRunning || !conveyorElement) return;
+        
+        updateClickPointsPosition();
+        
+        const pointCount = Math.min(5, clickPoints.length);
+        const selectedIndices = new Set();
+        
+        while (selectedIndices.size < pointCount) {
+            const randomIndex = Math.floor(Math.random() * clickPoints.length);
+            selectedIndices.add(randomIndex);
+        }
+        
+        for (const index of selectedIndices) {
+            const point = clickPoints[index];
+            if (!point) continue;
+            
+            const element = document.elementFromPoint(point.actualX, point.actualY);
+            
+            if (element && isShardElement(element)) {
+                highlightPoint(point);
+                
+                safeDispatchClick(element, point.actualX, point.actualY);
+                
+                const shardId = element.getAttribute('data-shard-id') || 
+                                (element.closest('[data-shard-id]')?.getAttribute('data-shard-id')) || 
+                                'unknown';
+                
+                if (!shardCache.has(shardId)) {
+                    shardCache.add(shardId);
+                    config.hitCount++;
+                    config.recentHits.push(Date.now());
+                    
+                    if (shardCache.size > 100) {
+                        const oldestShard = Array.from(shardCache)[0];
+                        shardCache.delete(oldestShard);
+                    }
+                    
+                    if (config.debug) {
+                        const shardValue = element.getAttribute('data-value') || 
+                                          (element.closest('[data-value]')?.getAttribute('data-value')) || 
+                                          'unknown';
+                        console.log(`点击了钻石 ID: ${shardId}, 价值: ${shardValue}`);
+                    }
+                }
+            }
+        }
+    }
+
+    function startClicking() {
+        if (clickIntervalId) return;
+        
+        clickIntervalId = setInterval(performClicks, config.clickInterval);
+        console.log('点击器已启动，间隔: ' + config.clickInterval + 'ms');
+        
+        if (!statsIntervalId) {
+            statsIntervalId = setInterval(updateStats, 1000);
+        }
+    }
+
+    function stopClicking() {
+        if (clickIntervalId) {
+            clearInterval(clickIntervalId);
+            clickIntervalId = null;
+            console.log('点击器已停止');
+        }
+        
+        if (statsIntervalId) {
+            clearInterval(statsIntervalId);
+            statsIntervalId = null;
+        }
+    }
+
+    function handleViewportChange() {
+        updateClickPointsPosition();
+    }
+
+    function initializeClicker() {
+        console.log('Uranium全覆盖点击器 v1.0 正在初始化...');
+        
+        initClickGrid();
+        
+        const panel = createControlPanel();
+        
+        window.addEventListener('resize', handleViewportChange);
+        window.addEventListener('scroll', handleViewportChange);
+        
+        setInterval(() => {
+            if (!conveyorElement || !document.body.contains(conveyorElement)) {
+                conveyorElement = findConveyorElement();
+                if (conveyorElement) {
+                    updateClickPointsPosition();
+                }
+            }
+        }, 2000);
+        
+        if (config.isRunning) {
+            startClicking();
+        }
+        
+        console.log('Uranium全覆盖点击器初始化完成!');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => setTimeout(initializeClicker, 1000));
+    } else {
+        setTimeout(initializeClicker, 1000);
+    }
+})(); 
